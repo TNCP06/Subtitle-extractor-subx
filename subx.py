@@ -301,7 +301,8 @@ def cmd_hard(args):
         prev, prev_text = None, ""
         n = 0
 
-        with ProcessPoolExecutor(max_workers=max(1, multiprocessing.cpu_count()), initializer=_init_ocr) as pool:
+        n_workers = args.workers or max(1, multiprocessing.cpu_count())
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_ocr) as pool:
             for t, frame in iter_frames(args.video, args.fps, args.crop, args.start, args.duration):
                 if prev is not None and float(
                         np.mean(np.abs(frame.astype(np.int16) - prev) > 25)) < args.diff_thresh:
@@ -531,6 +532,8 @@ def main():
     hp.add_argument("--diff-thresh", type=float, default=0.003,
                     help="fraction of pixels that must change to re-OCR (default 0.003)")
     hp.add_argument("--min-score", type=float, default=0.5, help="OCR confidence cutoff (default 0.5)")
+    hp.add_argument("--workers", type=int, default=0,
+                    help="OCR worker processes for CPU path (default: all cores; lower if low RAM)")
     hp.add_argument("--start", type=float, help="start offset in seconds (split work across sessions)")
     hp.add_argument("--duration", type=float, help="seconds to process from --start")
     hp.set_defaults(fn=cmd_hard)
