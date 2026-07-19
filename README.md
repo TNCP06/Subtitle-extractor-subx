@@ -24,6 +24,7 @@ python subx.py list video.mkv
 ```bash
 python subx.py soft video.mkv                # stream pertama → video.srt
 python subx.py soft video.mkv -s 2 -o out.srt
+python subx.py soft video.mkv --all          # SEMUA stream teks → video.<lang>.srt
 ```
 
 Stream teks (SRT/ASS/mov_text/WebVTT) dikonversi ke `.srt`. Stream bitmap (PGS/DVD sub) disalin mentah ke `.sup`/`.sub` — OCR dulu (mis. Subtitle Edit) kalau butuh teks.
@@ -36,6 +37,12 @@ python subx.py hard video.mp4                # → video.srt
 
 Cara kerja: sampling frame via ffmpeg, crop bagian bawah, deteksi perubahan antar-frame, OCR (RapidOCR) hanya saat gambar berubah, lalu gabung jadi cue SRT.
 
+Otomatis memilih jalur tercepat:
+- **GPU (CUDA)** — jika `onnxruntime-gpu` terpasang dan GPU terdeteksi: satu session ONNX dipakai bersama beberapa thread. Progress menampilkan providers aktual + kecepatan (`Nx realtime`).
+- **CPU** — default: OCR paralel (multiprocessing) ke seluruh core.
+
+Untuk GPU: `pip uninstall onnxruntime && pip install onnxruntime-gpu` (versi harus cocok dengan CUDA terpasang).
+
 Opsi tuning:
 
 | Flag | Default | Fungsi |
@@ -44,6 +51,10 @@ Opsi tuning:
 | `--crop` | `0.35` | fraksi bawah frame yang dipindai; sesuaikan jika posisi subtitle beda |
 | `--diff-thresh` | `0.003` | fraksi piksel berubah untuk memicu OCR ulang; turunkan jika ada subtitle tertelan |
 | `--min-score` | `0.5` | ambang confidence OCR |
+| `--start` | — | mulai dari detik ke-N (untuk membagi kerja antar mesin/sesi) |
+| `--duration` | — | proses N detik saja dari `--start` |
+
+Contoh split video 2 jam ke 2 mesin: mesin A `--duration 3600`, mesin B `--start 3600`, lalu gabungkan isi kedua `.srt` (timestamp sudah otomatis offset).
 
 ### Translate SRT
 

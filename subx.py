@@ -20,6 +20,22 @@ TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 BITMAP_EXT = {"hdmv_pgs_subtitle": ".sup", "dvd_subtitle": ".sub", "dvb_subtitle": ".sub"}
 
 
+_ISO3_TO_ISO2 = {
+    "eng": "en", "ind": "id", "may": "ms", "msa": "ms", "jpn": "ja", "kor": "ko",
+    "chi": "zh", "zho": "zh", "spa": "es", "fre": "fr", "fra": "fr", "ger": "de",
+    "deu": "de", "por": "pt", "rus": "ru", "ara": "ar", "hin": "hi", "tha": "th",
+    "vie": "vi", "ita": "it", "dut": "nl", "nld": "nl", "tur": "tr", "tgl": "tl",
+    "fil": "tl",
+}
+
+def sanitize_lang(lang, fallback="orig"):
+    lang = (lang or "").strip().lower()
+    lang = _ISO3_TO_ISO2.get(lang, lang)
+    if re.fullmatch(r"[a-z]{2,8}", lang) and lang != "und":
+        return lang
+    return fallback
+
+
 def ffprobe(video, select=None):
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams"]
     if select:
@@ -41,30 +57,52 @@ def cmd_list(args):
               f'lang={tags.get("language", "?")}  title={tags.get("title", "")}')
 
 
+def _extract_one(video, s, out):
+    """Extract one subtitle stream. Text → out (converted); bitmap → raw copy. Returns out or None."""
+    codec = s["codec_name"]
+    if codec in TEXT_CODECS:
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video),
+                        "-map", f'0:{s["index"]}', str(out)], check=True)
+        try:
+            text = Path(out).read_text(encoding="utf-8", errors="replace")
+            if "-->" not in text:
+                Path(out).unlink(missing_ok=True)
+                print(f'stream #{s["index"]} holds no cues, skipped.')
+                return None
+        except Exception:
+            pass
+        return out
+    out = str(Path(out).with_suffix(BITMAP_EXT.get(codec, ".mks")))
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video),
+                    "-map", f'0:{s["index"]}', "-c", "copy", str(out)], check=True)
+    print(f'stream #{s["index"]} is bitmap ({codec}), copied raw to {out}. '
+          f"for text, OCR it (e.g. SubtitleEdit) or use: subx.py hard")
+    return None
+
+
 def cmd_soft(args):
     streams = ffprobe(args.video, "s")
     if not streams:
         sys.exit("no embedded subtitle streams. use: subx.py hard")
+    base = Path(args.video).with_suffix("")
+    if args.all:
+        wrote = 0
+        for s in streams:
+            raw_lang = s.get("tags", {}).get("language")
+            lang = sanitize_lang(raw_lang, fallback=f's{s["index"]}')
+            if _extract_one(args.video, s, f"{base}.{lang}.srt"):
+                print(f"wrote {base}.{lang}.srt")
+                wrote += 1
+        if not wrote:
+            sys.exit("no text subtitle streams extracted (bitmap-only or empty?)")
+        return
     if args.stream is not None:
         streams = [s for s in streams if s["index"] == args.stream]
         if not streams:
             sys.exit(f"no subtitle stream with index {args.stream} (see: subx.py list)")
-    s = streams[0]
-    codec = s["codec_name"]
-    base = Path(args.video).with_suffix("")
-    if codec in TEXT_CODECS:
-        out = args.output or f"{base}.srt"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(args.video),
-                        "-map", f'0:{s["index"]}', str(out)], check=True)
-    else:
-        # bitmap sub: no text to convert, copy raw stream out
-        out = args.output or f'{base}{BITMAP_EXT.get(codec, ".mks")}'
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(args.video),
-                        "-map", f'0:{s["index"]}', "-c", "copy", str(out)], check=True)
-        print(f"stream is bitmap ({codec}), copied raw to {out}. "
-              f"for text, OCR it (e.g. SubtitleEdit) or use: subx.py hard")
-        return
-    print(f"wrote {out}")
+    out = _extract_one(args.video, streams[0], args.output or f"{base}.srt")
+    if out:
+        print(f"wrote {out}")
 
 
 # ---------- hardsub ----------
@@ -75,24 +113,43 @@ def video_dims(video):
         sys.exit("no video stream found")
     return int(v[0]["width"]), int(v[0]["height"])
 
+def video_duration(video):
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=noprint_wrappers=1:nokey=1", str(video)]
+    try:
+        return float(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip())
+    except (ValueError, subprocess.CalledProcessError):
+        return 0.0
 
-def iter_frames(video, fps, crop_ratio):
+
+def iter_frames(video, fps, crop_ratio, start=None, duration=None):
     """Yield (t_seconds, gray_ndarray) of the bottom crop_ratio of each sampled frame."""
     import numpy as np
     w, h = video_dims(video)
     ch = int(h * crop_ratio)
-    vf = f"fps={fps},crop={w}:{ch}:0:{h - ch},format=gray"
-    proc = subprocess.Popen(
-        ["ffmpeg", "-v", "error", "-i", str(video), "-vf", vf,
-         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
-        stdout=subprocess.PIPE)
+    vf = f"fps={fps},crop={w}:{ch}:0:{h - ch}"
+    if w > 1280:  # ponytail: OCR det resizes to ~736px internally anyway; smaller pipe = less CPU
+        ch = int(ch * 1280 / w) & ~1
+        w = 1280
+        vf += f",scale={w}:{ch}"
+    vf += ",format=gray"
+    
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "auto"]
+    if start is not None:
+        cmd.extend(["-ss", str(start)])
+    if duration is not None:
+        cmd.extend(["-t", str(duration)])
+    cmd.extend(["-i", str(video), "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+    
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
     size = w * ch
     i = 0
+    base_t = float(start) if start is not None else 0.0
     while True:
         buf = proc.stdout.read(size)
         if len(buf) < size:
             break
-        yield i / fps, np.frombuffer(buf, np.uint8).reshape(ch, w)
+        yield base_t + (i / fps), np.frombuffer(buf, np.uint8).reshape(ch, w)
         i += 1
     proc.wait()
 
@@ -136,35 +193,144 @@ def write_srt(cues, path):
             f.write(f"{i}\n{srt_ts(a)} --> {srt_ts(b)}\n{text}\n\n")
 
 
+_worker_ocr = None
+_use_gpu = None  # tri-state: None = not checked, True/False = cached result
+
+
+def _has_gpu():
+    """Check if CUDA GPU is available via onnxruntime."""
+    global _use_gpu
+    if _use_gpu is None:
+        try:
+            import onnxruntime as ort
+            _use_gpu = "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            _use_gpu = False
+        if _use_gpu:
+            print("GPU (CUDA) detected — using parallel multiprocessing GPU chunks", file=sys.stderr)
+        else:
+            print("No GPU detected — using CPU multiprocessing", file=sys.stderr)
+    return _use_gpu
+
+
+def _init_ocr():
+    """Initialise the OCR engine in a worker (or main) process."""
+    global _worker_ocr
+    from rapidocr_onnxruntime import RapidOCR
+    if _has_gpu():
+        _worker_ocr = RapidOCR(
+            det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True,
+        )
+        try:
+            provs = _worker_ocr.text_det.infer.session.get_providers()
+            print(f"OCR session providers: {provs}", file=sys.stderr)
+            if "CUDAExecutionProvider" not in provs:
+                print("WARNING: session fell back to CPU — check onnxruntime-gpu/cuDNN install",
+                      file=sys.stderr)
+        except AttributeError:
+            pass
+    else:
+        _worker_ocr = RapidOCR()
+
+
+def _do_ocr(args):
+    frame, min_score = args
+    return _do_ocr_local(frame, min_score)
+
+
+def _do_ocr_local(frame, min_score):
+    import numpy as np
+    # use_cls=False: subtitles are never rotated, skip the angle-classifier pass
+    result, _ = _worker_ocr(np.stack([frame] * 3, axis=-1), use_cls=False)
+    if not result:
+        return ""
+    lines = [(box[0][1], txt) for box, txt, score in result if float(score) >= min_score]
+    return "\n".join(t for _, t in sorted(lines))
+
+
 def cmd_hard(args):
     import numpy as np
-    from rapidocr_onnxruntime import RapidOCR
-    ocr = RapidOCR()
+    import collections
+    import multiprocessing
+    import time
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-    def ocr_text(frame):
-        result, _ = ocr(np.stack([frame] * 3, axis=-1))
-        if not result:
-            return ""
-        lines = [(box[0][1], txt) for box, txt, score in result if float(score) >= args.min_score]
-        return "\n".join(t for _, t in sorted(lines))
+    gpu = _has_gpu()
+    t0 = time.time()
+    base = args.start or 0.0
 
-    def samples():
+    def resolve_samples_gpu():
+        """GPU path: one shared ONNX session, 2 OCR threads (session.run is
+        thread-safe) so CPU pre/post-processing overlaps GPU inference.
+        Single process — multiprocessing here caused CUDA OOM on Colab."""
+        _init_ocr()
+        pending = collections.deque()
         prev, prev_text = None, ""
         n = 0
-        for t, frame in iter_frames(args.video, args.fps, args.crop):
-            # ponytail: changed-pixel-fraction gate skips OCR on static frames; lower --diff-thresh if subs get swallowed
-            if prev is not None and float(
-                    np.mean(np.abs(frame.astype(np.int16) - prev) > 25)) < args.diff_thresh:
-                yield t, prev_text
-            else:
-                prev_text = ocr_text(frame)
-                yield t, prev_text
-            prev = frame
-            n += 1
-            if n % (args.fps * 60) == 0:
-                print(f"  {int(t // 60)} min processed...", file=sys.stderr)
+        # ponytail: 2 workers matches Colab's 2 CPU cores; bump if host has more
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for t, frame in iter_frames(args.video, args.fps, args.crop, args.start, args.duration):
+                if prev is not None and float(
+                        np.mean(np.abs(frame.astype(np.int16) - prev) > 25)) < args.diff_thresh:
+                    fut = None
+                else:
+                    fut = pool.submit(_do_ocr_local, frame, args.min_score)
 
-    cues = build_cues(samples(), min_gap=0.2)
+                pending.append((t, fut))
+                prev = frame
+                n += 1
+                if n % (args.fps * 60) == 0:
+                    print(f"  {int(t // 60)} min processed "
+                          f"({(t - base) / max(time.time() - t0, 1e-9):.1f}x realtime)...",
+                          file=sys.stderr)
+
+                while len(pending) > args.fps * 30:
+                    pt, pfut = pending.popleft()
+                    if pfut is not None:
+                        prev_text = pfut.result()
+                    yield pt, prev_text
+
+            for pt, pfut in pending:
+                if pfut is not None:
+                    prev_text = pfut.result()
+                yield pt, prev_text
+
+    def resolve_samples_cpu():
+        """Multi-process path: fan out OCR across CPU cores."""
+        pending = collections.deque()
+        prev, prev_text = None, ""
+        n = 0
+
+        with ProcessPoolExecutor(max_workers=max(1, multiprocessing.cpu_count()), initializer=_init_ocr) as pool:
+            for t, frame in iter_frames(args.video, args.fps, args.crop, args.start, args.duration):
+                if prev is not None and float(
+                        np.mean(np.abs(frame.astype(np.int16) - prev) > 25)) < args.diff_thresh:
+                    fut = None
+                else:
+                    fut = pool.submit(_do_ocr, (frame, args.min_score))
+
+                pending.append((t, fut))
+                prev = frame
+                n += 1
+
+                if n % (args.fps * 60) == 0:
+                    print(f"  {int(t // 60)} min processed "
+                          f"({(t - base) / max(time.time() - t0, 1e-9):.1f}x realtime)...",
+                          file=sys.stderr)
+
+                while len(pending) > args.fps * 60:
+                    pt, pfut = pending.popleft()
+                    if pfut is not None:
+                        prev_text = pfut.result()
+                    yield pt, prev_text
+
+            for pt, pfut in pending:
+                if pfut is not None:
+                    prev_text = pfut.result()
+                yield pt, prev_text
+
+    samples = resolve_samples_gpu() if gpu else resolve_samples_cpu()
+    cues = build_cues(samples, min_gap=0.2)
     out = args.output or str(Path(args.video).with_suffix("")) + ".srt"
     write_srt(cues, out)
     print(f"wrote {len(cues)} cues to {out}")
@@ -248,21 +414,28 @@ def cmd_gui(args):
             return
         srt_out = str(Path(video).with_suffix("")) + ".srt"
 
+        def run_job(job):
+            q.put("$ subx " + " ".join(job))
+            p = subprocess.Popen([sys.executable, __file__] + job,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 encoding="utf-8", errors="replace")
+            for line in p.stdout:
+                q.put(line.rstrip())
+            if p.wait() != 0:
+                q.put(f"!! exit code {p.returncode}")
+                return False
+            return True
+
         def worker():
             try:
-                jobs = [cli_args + [video]]
-                if then_translate and translate_var.get():
-                    jobs.append(["translate", srt_out, "--to", lang_var.get()])
-                for job in jobs:
-                    q.put("$ subx " + " ".join(job))
-                    p = subprocess.Popen([sys.executable, __file__] + job,
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                         encoding="utf-8", errors="replace")
-                    for line in p.stdout:
-                        q.put(line.rstrip())
-                    if p.wait() != 0:
-                        q.put(f"!! exit code {p.returncode}")
-                        break
+                ok = run_job(cli_args + [video])
+                # Translate only if the extraction actually produced the .srt —
+                # a bitmap softsub writes .sup/.sub instead and can't be translated.
+                if ok and then_translate and translate_var.get():
+                    if Path(srt_out).exists():
+                        run_job(["translate", srt_out, "--to", lang_var.get()])
+                    else:
+                        q.put(f"!! {srt_out} not found — nothing to translate (bitmap subtitle?)")
             finally:
                 q.put(("__done__",))
 
@@ -345,6 +518,8 @@ def main():
     spp = sub.add_parser("soft", help="extract embedded (softsub) subtitle")
     spp.add_argument("video")
     spp.add_argument("-s", "--stream", type=int, help="stream index from 'list' (default: first)")
+    spp.add_argument("-a", "--all", action="store_true",
+                     help="extract EVERY text stream to <video>.<lang>.srt")
     spp.add_argument("-o", "--output")
     spp.set_defaults(fn=cmd_soft)
 
@@ -356,6 +531,8 @@ def main():
     hp.add_argument("--diff-thresh", type=float, default=0.003,
                     help="fraction of pixels that must change to re-OCR (default 0.003)")
     hp.add_argument("--min-score", type=float, default=0.5, help="OCR confidence cutoff (default 0.5)")
+    hp.add_argument("--start", type=float, help="start offset in seconds (split work across sessions)")
+    hp.add_argument("--duration", type=float, help="seconds to process from --start")
     hp.set_defaults(fn=cmd_hard)
 
     tp = sub.add_parser("translate", help="translate an .srt file")
